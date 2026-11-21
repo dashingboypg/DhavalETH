@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+DhavalETH_state.json
+*.backup*
+*.tmp
