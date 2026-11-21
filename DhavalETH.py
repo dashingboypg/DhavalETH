@@ -1,14 +1,20 @@
-import hashlib
+#!/usr/bin/env python3
 import os
 import json
 import time
+import hmac
+import hashlib
+import fcntl
 import uuid
+import requests
 import boto3
-from decimal import Decimal, ROUND_HALF_UP
-from delta_rest_client import DeltaRestClient
+
+from pathlib import Path
+from decimal import Decimal, ROUND_FLOOR, ROUND_HALF_UP
+from urllib.parse import urlencode
 
 # ============================================================
-# DHAVALETH - ETHUSD INVENTORY-BACKED SELL LADDER
+# DHAVALETH - ETHUSD SELL LADDER
 # ============================================================
 
 BOT_NAME = "DhavalETH"
@@ -19,13 +25,21 @@ BASE_URL = "https://api.india.delta.exchange"
 SYMBOL = "ETHUSD"
 PRODUCT_ID = 3136
 
-BOT_PREFIX = "DHE-"
-BASE_DIR = "/home/ec2-user/delta-bot/DhavalETH"
-STATE_FILE = os.path.join(BASE_DIR, "DhavalETH_state.json")
+PREFIX = "DHE-"
 
-POLL_SECONDS = 2
-ERROR_SLEEP = 5
+BASE_DIR = Path("/home/ec2-user/delta-bot/DhavalETH")
+STATE_FILE = BASE_DIR / "DhavalETH_state.json"
+LOCK_FILE = BASE_DIR / "DhavalETH.lock"
 
+POLL_SECONDS = 3
+RETRY_SECONDS = 15
+MAX_EXCHANGE_ORDERS = 100
+PAGE_SIZE = 100
+
+
+# ============================================================
+# LOGGING
+# ============================================================
 
 def log(message):
     print(
@@ -37,14 +51,20 @@ def log(message):
 
 
 # ============================================================
-# LOAD AWS SECRET
+# AWS SECRETS MANAGER
 # ============================================================
 
 def load_config():
-    session = boto3.session.Session(region_name=AWS_REGION)
-    sm = session.client("secretsmanager")
 
-    response = sm.get_secret_value(SecretId=SECRET_NAME)
+    client = boto3.client(
+        "secretsmanager",
+        region_name=AWS_REGION
+    )
+
+    response = client.get_secret_value(
+        SecretId=SECRET_NAME
+    )
+
     data = json.loads(response["SecretString"])
 
     required = [
@@ -56,53 +76,62 @@ def load_config():
         "Counter_Step"
     ]
 
-    missing = [key for key in required if key not in data]
-    if missing:
-        raise RuntimeError(f"Missing secret fields: {missing}")
+    for key in required:
+        if key not in data:
+            raise RuntimeError(
+                f"Missing secret field: {key}"
+            )
+
+    def number(key):
+
+        value = str(data[key]).strip()
+
+        value = (
+            value.replace("$", "")
+            .replace(",", "")
+            .replace("lots", "")
+            .replace("lot", "")
+            .strip()
+        )
+
+        result = Decimal(value)
+
+        if not result.is_finite() or result <= 0:
+            raise RuntimeError(
+                f"Invalid secret value: {key}"
+            )
+
+        return result
 
     api_key = str(data["API_Key"]).strip()
     api_secret = str(data["API_Secret"]).strip()
 
-    def read_number(key):
-        raw = str(data[key]).strip()
-        cleaned = (
-            raw.replace("$", "")
-               .replace(",", "")
-               .replace("lots", "")
-               .replace("lot", "")
-               .strip()
-        )
-        try:
-            value = Decimal(cleaned)
-        except Exception:
-            raise RuntimeError(f"Invalid secret value for {key}: {raw!r}")
+    maximum = number("Max_Position")
+    order_size = number("Order_Size")
+    step = number("Step")
+    counter_step = number("Counter_Step")
 
-        if not value.is_finite() or value <= 0:
-            raise RuntimeError(f"Invalid secret value: {key}")
+    if not api_key or not api_secret:
+        raise RuntimeError("Empty API credentials")
 
-        return value
-
-    max_position = read_number("Max_Position")
-    order_size = read_number("Order_Size")
-    step = read_number("Step")
-    counter_step = read_number("Counter_Step")
-
-    if max_position != max_position.to_integral_value():
+    if maximum != maximum.to_integral_value():
         raise RuntimeError("Max_Position must be whole lots")
 
     if order_size != order_size.to_integral_value():
         raise RuntimeError("Order_Size must be whole lots")
 
-    if max_position < order_size:
-        raise RuntimeError("Max_Position is smaller than Order_Size")
+    if maximum < order_size:
+        raise RuntimeError("Max_Position is too small")
 
-    if not api_key or not api_secret:
-        raise RuntimeError("AWS API credentials are empty")
+    if maximum % order_size != 0:
+        raise RuntimeError(
+            "Max_Position must be divisible by Order_Size"
+        )
 
     return (
         api_key,
         api_secret,
-        int(max_position),
+        int(maximum),
         int(order_size),
         step,
         counter_step
@@ -111,12 +140,261 @@ def load_config():
 
 API_KEY, API_SECRET, MAX_POSITION, ORDER_SIZE, STEP, COUNTER_STEP = load_config()
 
-client = DeltaRestClient(
-    base_url=BASE_URL,
-    api_key=API_KEY,
-    api_secret=API_SECRET,
-    raise_for_status=True
-)
+
+# ============================================================
+# PRICE ROUNDING
+# Nearest whole-dollar price ending in 7
+# Examples: 1707, 1717, 1727, 1737
+# ============================================================
+
+def round_price(value):
+
+    value = Decimal(str(value))
+
+    lower = (
+        (value - Decimal(7)) / Decimal(10)
+    ).to_integral_value(rounding=ROUND_FLOOR)
+
+    lower_price = lower * Decimal(10) + Decimal(7)
+    upper_price = lower_price + Decimal(10)
+
+    if abs(value - lower_price) <= abs(value - upper_price):
+        return lower_price
+
+    return upper_price
+
+
+def price_text(value):
+    return format(
+        Decimal(str(value)).normalize(),
+        "f"
+    )
+
+
+def new_client_id():
+    return PREFIX + uuid.uuid4().hex[:24]
+
+
+def counter_client_id(fill_id):
+    digest = hashlib.sha256(
+        str(fill_id).encode()
+    ).hexdigest()[:24]
+
+    return PREFIX + "F" + digest
+
+
+# ============================================================
+# DELTA EXCHANGE API
+# ============================================================
+
+class DeltaAPI:
+
+    def __init__(self):
+
+        self.session = requests.Session()
+
+        self.session.headers.update({
+            "User-Agent": "python-3.11 DhavalETH",
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+        })
+
+    def request(
+        self,
+        method,
+        path,
+        params=None,
+        body=None,
+        authenticated=True
+    ):
+
+        params = params or {}
+
+        query = urlencode(params)
+
+        payload = ""
+
+        if body is not None:
+            payload = json.dumps(
+                body,
+                separators=(",", ":"),
+                ensure_ascii=False
+            )
+
+        headers = {}
+
+        if authenticated:
+
+            timestamp = str(int(time.time()))
+
+            message = (
+                method.upper()
+                + timestamp
+                + path
+                + ("?" + query if query else "")
+                + payload
+            )
+
+            signature = hmac.new(
+                API_SECRET.encode(),
+                message.encode(),
+                hashlib.sha256
+            ).hexdigest()
+
+            headers.update({
+                "api-key": API_KEY,
+                "timestamp": timestamp,
+                "signature": signature
+            })
+
+        response = self.session.request(
+            method.upper(),
+            BASE_URL + path,
+            params=params if params else None,
+            data=payload if body is not None else None,
+            headers=headers,
+            timeout=(5, 25)
+        )
+
+        try:
+            data = response.json()
+        except Exception:
+            raise RuntimeError(
+                f"Non-JSON response HTTP {response.status_code}"
+            )
+
+        if not response.ok or data.get("success") is False:
+            raise RuntimeError(
+                f"Delta HTTP {response.status_code}: "
+                f"{json.dumps(data)[:600]}"
+            )
+
+        return data
+
+    def ticker(self):
+
+        data = self.request(
+            "GET",
+            f"/v2/tickers/{SYMBOL}",
+            authenticated=False
+        )
+
+        result = data["result"]
+
+        price = (
+            result.get("close")
+            or result.get("mark_price")
+        )
+
+        if not price:
+            raise RuntimeError("ETHUSD price unavailable")
+
+        return Decimal(str(price))
+
+    def active_orders(self):
+
+        orders = []
+        cursor = None
+
+        while True:
+
+            params = {
+                "product_ids": str(PRODUCT_ID),
+                "states": "open,pending",
+                "page_size": PAGE_SIZE
+            }
+
+            if cursor:
+                params["after"] = cursor
+
+            data = self.request(
+                "GET",
+                "/v2/orders",
+                params=params
+            )
+
+            orders.extend(data.get("result", []))
+
+            cursor = data.get("meta", {}).get("after")
+
+            if not cursor:
+                break
+
+        return orders
+
+    def order_by_id(self, order_id):
+
+        data = self.request(
+            "GET",
+            f"/v2/orders/{order_id}"
+        )
+
+        return data["result"]
+
+    def order_by_client_id(self, client_id):
+
+        data = self.request(
+            "GET",
+            f"/v2/orders/client_order_id/{client_id}"
+        )
+
+        return data["result"]
+
+    def create_order(self, intent):
+
+        body = {
+            "product_id": PRODUCT_ID,
+            "size": int(intent["size"]),
+            "side": intent["side"],
+            "order_type": "limit_order",
+            "limit_price": price_text(intent["price"]),
+            "time_in_force": "gtc",
+            "post_only": False,
+            "reduce_only": intent["side"] == "sell",
+            "client_order_id": intent["client_id"]
+        }
+
+        data = self.request(
+            "POST",
+            "/v2/orders",
+            body=body
+        )
+
+        return data["result"]
+
+    def fills(self, start_time):
+
+        fills = []
+        cursor = None
+
+        while True:
+
+            params = {
+                "product_id": PRODUCT_ID,
+                "start_time": int(start_time),
+                "page_size": PAGE_SIZE
+            }
+
+            if cursor:
+                params["after"] = cursor
+
+            data = self.request(
+                "GET",
+                "/v2/fills",
+                params=params
+            )
+
+            fills.extend(data.get("result", []))
+
+            cursor = data.get("meta", {}).get("after")
+
+            if not cursor:
+                break
+
+        return fills
+
+
+API = DeltaAPI()
 
 
 # ============================================================
@@ -124,594 +402,589 @@ client = DeltaRestClient(
 # ============================================================
 
 def default_state():
+
     return {
-        "version": 1,
+        "version": 3,
         "initialized": False,
-        "next_sequence": 1,
-        "bot_net_sold": 0,
-        "orders": {}
+        "anchor": None,
+        "net_sold": 0,
+        "orders": {},
+        "pending": {},
+        "processed_fills": [],
+        "last_fill_scan": int(time.time() * 1000000),
+        "created_at": int(time.time())
     }
 
 
 def load_state():
-    if not os.path.exists(STATE_FILE):
+
+    if not STATE_FILE.exists():
         return default_state()
 
-    with open(STATE_FILE, "r") as file:
+    with STATE_FILE.open() as file:
         state = json.load(file)
 
-    if not isinstance(state, dict) or state.get("version") != 1:
-        raise RuntimeError("Invalid DhavalETH state file")
-
-    required = [
-        "initialized",
-        "next_sequence",
-        "bot_net_sold",
-        "orders"
-    ]
-
-    for key in required:
-        if key not in state:
-            raise RuntimeError(f"State file missing {key}")
-
-    if not isinstance(state["orders"], dict):
-        raise RuntimeError("Invalid order records in state")
+    if state.get("version") != 3:
+        raise RuntimeError(
+            "Incompatible state file. "
+            "Existing state will not be overwritten."
+        )
 
     return state
 
 
-STATE = load_state()
-STATE.setdefault("counter_queue", {})
+STATE = None
 
 
 def save_state():
-    temp = STATE_FILE + ".tmp"
 
-    with open(temp, "w") as file:
-        json.dump(STATE, file, indent=2)
+    temporary = STATE_FILE.with_suffix(".tmp")
+
+    with temporary.open("w") as file:
+
+        json.dump(
+            STATE,
+            file,
+            indent=2
+        )
+
         file.flush()
         os.fsync(file.fileno())
 
-    os.replace(temp, STATE_FILE)
-
-
-# ============================================================
-# HELPERS
-# ============================================================
-
-def unwrap(response):
-    if isinstance(response, dict) and isinstance(response.get("result"), dict):
-        return response["result"]
-    return response
-
-
-def round_price(value):
-    return Decimal(str(value)).quantize(
-        Decimal("1"),
-        rounding=ROUND_HALF_UP
+    os.replace(
+        temporary,
+        STATE_FILE
     )
 
 
-def price_text(value):
-    return format(Decimal(str(value)).normalize(), "f")
-
-
-def new_client_id(role):
-    sequence = int(STATE["next_sequence"])
-    STATE["next_sequence"] = sequence + 1
-    save_state()
-
-    return f"{BOT_PREFIX}{role}-{sequence}-{uuid.uuid4().hex[:6]}"
-
-
 # ============================================================
-# MARKET DATA
+# ORDER QUEUE
 # ============================================================
 
-def get_cmp():
-    ticker = unwrap(client.get_ticker(SYMBOL))
-
-    if not isinstance(ticker, dict):
-        raise RuntimeError(f"Invalid ticker response: {ticker}")
-
-    for key in ("close", "last_price", "mark_price", "spot_price"):
-        if ticker.get(key) is not None:
-            price = Decimal(str(ticker[key]))
-            if price > 0:
-                return price
-
-    raise RuntimeError(f"Cannot read ETHUSD CMP: {ticker}")
-
-
-def get_net_position():
-    position = unwrap(client.get_position(PRODUCT_ID))
-
-    if not isinstance(position, dict):
-        raise RuntimeError(f"Invalid position response: {position}")
-
-    if position.get("size") is None:
-        raise RuntimeError(f"Position size missing: {position}")
-
-    return int(position["size"])
-
-
-# ============================================================
-# BOT OPEN ORDERS
-# ============================================================
-
-def get_live_orders():
-    response = client.get_live_orders(
-        query={
-            "product_ids": PRODUCT_ID,
-            "states": "open,pending"
-        }
-    )
-
-    if response is None:
-        return []
-
-    if isinstance(response, dict):
-        response = response.get("result", response.get("orders"))
-
-    if not isinstance(response, list):
-        raise RuntimeError(f"Invalid live orders response: {response}")
-
-    return [
-        order for order in response
-        if int(order.get("product_id", -1)) == PRODUCT_ID
-    ]
-
-
-def get_bot_open_orders():
-    result = {}
-
-    for order in get_live_orders():
-        client_id = str(order.get("client_order_id", ""))
-
-        if client_id.startswith(BOT_PREFIX):
-            result[str(order["id"])] = order
-
-    return result
-
-
-def get_bot_open_sells():
-    total = 0
-
-    for order in get_bot_open_orders().values():
-        if str(order.get("side", "")).lower() == "sell":
-            remaining = order.get("unfilled_size")
-
-            if remaining is None:
-                raise RuntimeError(
-                    f"Missing remaining size for bot order {order.get('id')}"
-                )
-
-            total += int(remaining)
-
-    return total
-
-
-def get_allocation():
-    return int(STATE["bot_net_sold"]) + get_bot_open_sells()
-
-
-# ============================================================
-# PLACE ORDER
-# ============================================================
-
-def place_limit(side, price, role, client_id=None):
-    side = side.lower()
-
-    if side not in ("buy", "sell"):
-        raise RuntimeError("Invalid order side")
+def queue_order(
+    side,
+    price,
+    size,
+    role,
+    client_id=None
+):
 
     price = round_price(price)
 
-    if price <= 0:
-        raise RuntimeError("Invalid order price")
+    if price <= 0 or size <= 0:
+        raise RuntimeError("Invalid order intent")
 
-    if side == "sell":
-        position = get_net_position()
+    if client_id is None:
+        client_id = new_client_id()
 
-        if position <= 0:
-            raise RuntimeError(
-                "SELL BLOCKED: account is not net long"
-            )
+    if client_id in STATE["pending"]:
+        return
 
-        reserved = get_bot_open_sells()
+    for order in STATE["orders"].values():
 
-        if position < reserved + ORDER_SIZE:
-            log(
-                "SELL BLOCKED: insufficient unreserved long inventory. "
-                f"Position={position}, reserved={reserved}"
-            )
-            return None
+        if order["client_id"] == client_id:
+            return
 
-        allocation = int(STATE["bot_net_sold"]) + reserved
-
-        if allocation + ORDER_SIZE > MAX_POSITION:
-            log(
-                f"SELL BLOCKED: bot allocation cap "
-                f"{allocation}/{MAX_POSITION}"
-            )
-            return None
-
-    client_id = client_id or new_client_id(role)
-
-    payload = {
-        "product_id": PRODUCT_ID,
-        "size": ORDER_SIZE,
+    STATE["pending"][client_id] = {
+        "client_id": client_id,
         "side": side,
-        "order_type": "limit_order",
-        "limit_price": price_text(price),
-        "time_in_force": "gtc",
-        "post_only": False,
-        "reduce_only": side == "sell",
-        "client_order_id": client_id
-    }
-
-    log(
-        f"PLACING {side.upper()} "
-        f"{ORDER_SIZE} LOT @ ${price_text(price)}"
-    )
-
-    response = unwrap(client.create_order(payload))
-
-    if not isinstance(response, dict) or response.get("id") is None:
-        raise RuntimeError(f"Order not confirmed: {response}")
-
-    order_id = str(response["id"])
-
-    STATE["orders"][order_id] = {
-        "side": side,
-        "role": role,
         "price": str(price),
-        "size": ORDER_SIZE,
-        "client_order_id": client_id,
-        "handled": False
+        "size": int(size),
+        "role": role,
+        "last_attempt": 0,
+        "created_at": int(time.time())
     }
 
     save_state()
 
-    log(f"ORDER CREATED | ID={order_id} | {client_id}")
 
-    return order_id
+def attach_order(order, intent):
 
+    order_id = str(order["id"])
 
-# ============================================================
-# STARTUP CHECK
-# ============================================================
-
-def reconcile_startup():
-    live = get_bot_open_orders()
-
-    exchange_ids = set(live.keys())
-
-    local_ids = {
-        str(order_id)
-        for order_id, info in STATE["orders"].items()
-        if not info.get("handled", False)
-        and str(order_id) in exchange_ids
+    STATE["orders"][order_id] = {
+        "client_id": intent["client_id"],
+        "side": intent["side"],
+        "price": str(intent["price"]),
+        "size": int(intent["size"]),
+        "role": intent["role"],
+        "processed_terminal": False
     }
 
-    unknown_ids = exchange_ids - set(STATE["orders"])
-    if unknown_ids:
-        raise RuntimeError(
-            "STARTUP HALTED: unknown DhavalETH live orders: "
-            f"{sorted(unknown_ids)}"
-        )
+    STATE["pending"].pop(
+        intent["client_id"],
+        None
+    )
 
-    missing_ids = {
-        str(order_id)
-        for order_id, info in STATE["orders"].items()
-        if not info.get("handled", False)
-        and str(order_id) not in exchange_ids
-    }
-
-    for order_id in missing_ids:
-        order = get_order_status(order_id)
-        state = str(order.get("state", "")).lower()
-        if state in ("open", "pending"):
-            raise RuntimeError(f"STARTUP HALTED: order {order_id} missing from live orders")
-
-    position = get_net_position()
-
-    if position < 0:
-        raise RuntimeError(
-            f"STARTUP HALTED: account is net short by {abs(position)} lots"
-        )
-
-    reserved = get_bot_open_sells()
-
-    if position < reserved:
-        raise RuntimeError(
-            "STARTUP HALTED: outstanding DhavalETH sells exceed "
-            "the current net long position"
-        )
-
-    allocation = int(STATE["bot_net_sold"]) + reserved
-
-    if allocation > MAX_POSITION:
-        raise RuntimeError(
-            f"STARTUP HALTED: allocation {allocation} exceeds "
-            f"Max_Position {MAX_POSITION}"
-        )
+    save_state()
 
     log(
-        f"STARTUP CHECK OK | Net long={position} | "
-        f"Bot net sold={STATE['bot_net_sold']} | "
-        f"Open bot sells={reserved} | Allocation={allocation}"
+        f"ORDER CONFIRMED | "
+        f"{intent['side'].upper()} "
+        f"{intent['size']} lots "
+        f"@ ${price_text(intent['price'])} "
+        f"| ID={order_id}"
     )
 
 
 # ============================================================
-# INITIAL LADDER
+# INITIAL SELL LADDER
 # ============================================================
 
-def initialize_ladder():
+def initialize():
+
     if STATE["initialized"]:
         return
 
-    cmp = get_cmp()
+    cmp = API.ticker()
+
     anchor = round_price(cmp)
 
     levels = MAX_POSITION // ORDER_SIZE
 
-    log("========================================")
-    log("DHAVALETH INITIAL SELL LADDER")
-    log("========================================")
-    log(f"CMP: {cmp}")
-    log(f"First sell: ${price_text(anchor + STEP)}")
-    log(f"Order size: {ORDER_SIZE}")
-    log(f"Step: ${STEP}")
-    log(f"Counter step: ${COUNTER_STEP}")
-    log(f"Maximum allocation: {MAX_POSITION}")
+    STATE["anchor"] = str(anchor)
 
     for level in range(1, levels + 1):
-        price = anchor + (STEP * level)
 
-        order_id = place_limit(
-            side="sell",
-            price=price,
-            role="I"
+        price = round_price(
+            anchor + STEP * level
         )
 
-        if order_id is None:
-            raise RuntimeError(
-                "Initial ladder stopped because inventory or allocation "
-                "was insufficient. Initialization remains incomplete."
-            )
-
-        time.sleep(0.15)
+        queue_order(
+            "sell",
+            price,
+            ORDER_SIZE,
+            "INITIAL"
+        )
 
     STATE["initialized"] = True
+
     save_state()
 
-    log(f"INITIAL LADDER READY | {levels} sell orders")
+    log(
+        f"INITIAL LADDER | CMP=${price_text(cmp)} "
+        f"| Anchor=${price_text(anchor)}"
+    )
+
+    log(
+        f"Levels={levels} | Order size={ORDER_SIZE}"
+    )
+
+    log(
+        f"Step=${price_text(STEP)} "
+        f"| Counter=${price_text(COUNTER_STEP)}"
+    )
 
 
 # ============================================================
-# ORDER STATUS
+# FILL PROCESSING
 # ============================================================
 
-def get_order_status(order_id):
-    response = unwrap(client.get_order_by_id(int(order_id)))
+def process_fills():
 
-    if not isinstance(response, dict):
-        raise RuntimeError(f"Invalid order status: {response}")
+    start = max(
+        0,
+        int(STATE["last_fill_scan"]) - 600000000
+    )
 
-    return response
+    fills = API.fills(start)
 
+    processed = set(
+        STATE["processed_fills"]
+    )
 
-def get_verified_fill(order, info):
-    total_size = int(order.get("size", info["size"]))
-    unfilled = order.get("unfilled_size")
+    order_lookup = {
+        str(order_id): info
+        for order_id, info in STATE["orders"].items()
+    }
 
-    if unfilled is None:
-        raise RuntimeError(
-            f"Cannot verify filled quantity for order {order.get('id')}"
-        )
+    latest_timestamp = STATE["last_fill_scan"]
 
-    filled = total_size - int(unfilled)
+    for fill in fills:
 
-    if filled < 0 or filled > total_size:
-        raise RuntimeError("Invalid fill quantity")
+        fill_id = str(fill.get("id", ""))
 
-    if filled not in (0, total_size):
-        raise RuntimeError(
-            "Partial fill detected. Bot halted for manual reconciliation."
-        )
-
-    price = order.get("average_fill_price")
-
-    if price is None:
-        price = order.get("limit_price", info["price"])
-
-    return filled, round_price(price)
-
-
-# ============================================================
-# PROCESS FILLS
-# ============================================================
-
-
-def find_order_by_client_id(client_id):
-    path = f"/v2/orders/client_order_id/{client_id}"
-    try:
-        response = client.request("GET", path, auth=True)
-    except Exception as exc:
-        message = str(exc).lower()
-        if "order_not_found" in message or "order not found" in message:
-            return None
-        raise
-
-    response = unwrap(response)
-    if isinstance(response, dict):
-        error_text = str(response.get("error", response.get("message", ""))).lower()
-        if "order_not_found" in error_text or "order not found" in error_text:
-            return None
-        if response.get("id") is not None:
-            return response
-    raise RuntimeError(f"Unexpected client-order lookup response: {response}")
-
-
-def process_pending_counters():
-    for client_id, item in list(STATE["counter_queue"].items()):
-        if item.get("status") != "pending":
+        if not fill_id or fill_id in processed:
             continue
 
-        # Recover an order accepted by Delta before a previous process crashed.
-        existing = find_order_by_client_id(client_id)
+        order_id = str(fill.get("order_id", ""))
 
-        if existing is not None:
-            order_id = str(existing["id"])
-            STATE["orders"][order_id] = {
-                "side": item["side"],
-                "role": item["role"],
-                "price": str(item["price"]),
-                "size": int(item["size"]),
-                "client_order_id": client_id,
-                "handled": False
-            }
-            item["status"] = "submitted"
-            item["exchange_order_id"] = order_id
-            save_state()
-            log(f"RECOVERED COUNTER ORDER | ID={order_id} | CID={client_id}")
+        info = order_lookup.get(order_id)
+
+        if info is None:
             continue
 
-        order_id = place_limit(
-            side=item["side"],
-            price=Decimal(str(item["price"])),
-            role=item["role"],
-            client_id=client_id
+        fill_size = int(fill["size"])
+
+        fill_price = round_price(
+            fill["price"]
         )
 
-        # None means a sell was blocked by current inventory/allocation checks.
-        # Keep it pending and retry on the next polling cycle.
-        if order_id is None:
+        if fill_size <= 0:
             continue
 
-        item["status"] = "submitted"
-        item["exchange_order_id"] = str(order_id)
+        if info["side"] == "sell":
+
+            counter_side = "buy"
+
+            counter_price = (
+                fill_price - COUNTER_STEP
+            )
+
+            role = "COUNTER_BUY"
+
+            STATE["net_sold"] += fill_size
+
+        else:
+
+            counter_side = "sell"
+
+            counter_price = (
+                fill_price + COUNTER_STEP
+            )
+
+            role = "COUNTER_SELL"
+
+            STATE["net_sold"] -= fill_size
+
+        queue_order(
+            counter_side,
+            counter_price,
+            fill_size,
+            role,
+            counter_client_id(fill_id)
+        )
+
+        STATE["processed_fills"].append(
+            fill_id
+        )
+
+        processed.add(fill_id)
+
+        timestamp = int(
+            fill.get("created_at_unix", 0)
+            or fill.get("created_at", 0)
+            or 0
+        )
+
+        latest_timestamp = max(
+            latest_timestamp,
+            timestamp
+        )
+
+        log(
+            f"FILL | {info['side'].upper()} "
+            f"{fill_size} lots "
+            f"@ ${price_text(fill_price)} "
+            f"| Counter {counter_side.upper()} "
+            f"@ ${price_text(counter_price)}"
+        )
+
         save_state()
-        log(f"COUNTER ORDER SUBMITTED | ID={order_id} | CID={client_id}")
+
+    STATE["processed_fills"] = (
+        STATE["processed_fills"][-20000:]
+    )
+
+    STATE["last_fill_scan"] = max(
+        int(time.time() * 1000000),
+        latest_timestamp
+    )
+
+    save_state()
 
 
-def process_tracked_orders():
-    for order_id, info in list(STATE["orders"].items()):
-        if info.get("handled"):
+# ============================================================
+# TERMINAL ORDER RECOVERY
+# ============================================================
+
+def process_terminal_orders(active):
+
+    active_ids = {
+        str(order["id"])
+        for order in active
+    }
+
+    for order_id, info in list(
+        STATE["orders"].items()
+    ):
+
+        if info["processed_terminal"]:
             continue
 
-        order = get_order_status(order_id)
-        status = str(order.get("state", "")).lower()
+        if order_id in active_ids:
+            continue
+
+        try:
+
+            order = API.order_by_id(order_id)
+
+        except Exception as error:
+
+            log(
+                f"ORDER STATUS RETRY "
+                f"{order_id}: {error}"
+            )
+
+            continue
+
+        status = str(
+            order.get("state", "")
+        ).lower()
 
         if status in ("open", "pending"):
             continue
 
-        if status in ("cancelled", "canceled"):
-            filled, _ = get_verified_fill(order, info)
-            if filled:
-                raise RuntimeError(
-                    f"Cancelled order {order_id} has a fill. "
-                    "Manual reconciliation required."
-                )
-            info["handled"] = True
-            save_state()
-            log(f"ORDER CANCELLED | {order_id}")
+        if status not in (
+            "closed",
+            "cancelled",
+            "canceled",
+            "rejected",
+            "expired"
+        ):
             continue
 
-        if status != "closed":
+        remaining = order.get("unfilled_size")
+
+        if remaining is None:
+            log(
+                f"Missing unfilled_size for {order_id}"
+            )
             continue
 
-        filled, fill_price = get_verified_fill(order, info)
+        remaining = int(remaining)
 
-        if filled == 0:
-            info["handled"] = True
-            save_state()
-            continue
+        if remaining > 0 and status in (
+            "rejected",
+            "expired"
+        ):
 
-        if filled != ORDER_SIZE:
-            raise RuntimeError("Partial fill detected. Manual reconciliation required.")
+            queue_order(
+                info["side"],
+                info["price"],
+                remaining,
+                info["role"]
+            )
 
-        # Prepare a deterministic counter order ID.
-        counter_side = "buy" if info["side"] == "sell" else "sell"
-        counter_role = "B" if counter_side == "buy" else "S"
-        counter_price = (
-            fill_price - COUNTER_STEP
-            if counter_side == "buy"
-            else fill_price + COUNTER_STEP
-        )
-        counter_price = round_price(counter_price)
-        counter_id = (
-            "DHE-C-" +
-            hashlib.sha256(str(order_id).encode()).hexdigest()[:20]
-        )
+            log(
+                f"FAILED ORDER RETRIED | "
+                f"{order_id} | Remaining={remaining}"
+            )
 
-        # One atomic local save records the fill AND its pending counter.
-        # A restart cannot lose the counter-order instruction.
-        if counter_id not in STATE["counter_queue"]:
-            STATE["counter_queue"][counter_id] = {
-                "status": "pending",
-                "parent_order_id": str(order_id),
-                "side": counter_side,
-                "role": counter_role,
-                "price": str(counter_price),
-                "size": filled
-            }
+        info["processed_terminal"] = True
 
-            if info["side"] == "sell":
-                STATE["bot_net_sold"] = int(STATE["bot_net_sold"]) + filled
-            else:
-                STATE["bot_net_sold"] = int(STATE["bot_net_sold"]) - filled
-
-        info["handled"] = True
-        info["fill_price"] = str(fill_price)
-        info["filled_size"] = filled
         save_state()
 
+
+# ============================================================
+# SUBMIT PENDING ORDERS
+# ============================================================
+
+def submit_pending():
+
+    if not STATE["pending"]:
+        return
+
+    active = API.active_orders()
+
+    # Exchange limit is account/instrument-wide.
+    # Manual orders count toward capacity but are never modified.
+    if len(active) >= MAX_EXCHANGE_ORDERS:
+
         log(
-            f"{info['side'].upper()} FILLED | ID={order_id} | "
-            f"Price={price_text(fill_price)} | "
-            f"Counter queued={counter_id}"
+            f"EXCHANGE ORDER LIMIT | "
+            f"{len(active)} active orders"
         )
 
-    process_pending_counters()
+        return
 
+    bot_active = [
+        order for order in active
+        if str(
+            order.get("client_order_id", "")
+        ).startswith(PREFIX)
+    ]
+
+    bot_sell_open = sum(
+        int(order.get("unfilled_size", 0))
+        for order in bot_active
+        if order.get("side") == "sell"
+    )
+
+    now = int(time.time())
+
+    for client_id, intent in list(
+        STATE["pending"].items()
+    ):
+
+        if len(active) >= MAX_EXCHANGE_ORDERS:
+            break
+
+        if (
+            now - int(intent.get("last_attempt", 0))
+            < RETRY_SECONDS
+        ):
+            continue
+
+        if intent["side"] == "sell":
+
+            projected = (
+                int(STATE["net_sold"])
+                + bot_sell_open
+                + int(intent["size"])
+            )
+
+            if projected > MAX_POSITION:
+                continue
+
+        try:
+
+            # Recover an order accepted before a lost response.
+            try:
+
+                existing = API.order_by_client_id(
+                    client_id
+                )
+
+                if existing:
+
+                    attach_order(
+                        existing,
+                        intent
+                    )
+
+                    active.append(existing)
+
+                    if intent["side"] == "sell":
+
+                        bot_sell_open += int(
+                            existing.get("unfilled_size", 0)
+                        )
+
+                    continue
+
+            except Exception as lookup_error:
+
+                message = str(
+                    lookup_error
+                ).lower()
+
+                if (
+                    "404" not in message
+                    and "not_found" not in message
+                    and "not found" not in message
+                ):
+                    raise
+
+            intent["last_attempt"] = now
+
+            save_state()
+
+            order = API.create_order(intent)
+
+            if not order.get("id"):
+                raise RuntimeError(
+                    "Exchange did not return an order ID"
+                )
+
+            attach_order(
+                order,
+                intent
+            )
+
+            active.append(order)
+
+            if intent["side"] == "sell":
+                bot_sell_open += int(intent["size"])
+
+        except Exception as error:
+
+            log(
+                f"ORDER SUBMISSION RETRY | "
+                f"{client_id} | {error}"
+            )
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
-    log("========================================")
-    log("STARTING DHAVALETH")
-    log("========================================")
 
-    log(f"AWS secret: {SECRET_NAME}")
-    log(f"Symbol: {SYMBOL}")
+    global STATE
+
+    BASE_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    lock = LOCK_FILE.open("w")
+
+    try:
+
+        fcntl.flock(
+            lock,
+            fcntl.LOCK_EX | fcntl.LOCK_NB
+        )
+
+    except BlockingIOError:
+
+        raise RuntimeError(
+            "DhavalETH is already running"
+        )
+
+    STATE = load_state()
+
+    log("====================================")
+    log("DHAVALETH STARTING")
+    log("====================================")
+
+    log(f"Secret: {SECRET_NAME}")
+    log(f"Instrument: {SYMBOL}")
     log(f"Product ID: {PRODUCT_ID}")
-    log(f"Max position: {MAX_POSITION}")
+
+    log(f"Maximum position: {MAX_POSITION}")
     log(f"Order size: {ORDER_SIZE}")
-    log(f"Step: {STEP}")
-    log(f"Counter step: {COUNTER_STEP}")
 
-    cmp = get_cmp()
-    log(f"Delta API connected | CMP=${cmp}")
+    log(f"Step: ${price_text(STEP)}")
+    log(f"Counter step: ${price_text(COUNTER_STEP)}")
 
-    reconcile_startup()
-    initialize_ladder()
+    log("Order prices round to nearest number ending in 7.")
+    log("Manual orders are not modified.")
+    log("SELL orders are reduce-only.")
 
-    log("DHAVALETH RUNNING")
+    initialize()
 
     while True:
+
         try:
-            process_tracked_orders()
+
+            process_fills()
+
+            active = API.active_orders()
+
+            process_terminal_orders(active)
+
+            submit_pending()
+
             time.sleep(POLL_SECONDS)
 
         except KeyboardInterrupt:
+
             log("DHAVALETH STOPPED")
+
             break
 
         except Exception as error:
-            log(f"ERROR: {type(error).__name__}: {error}")
-            time.sleep(ERROR_SLEEP)
+
+            log(
+                f"MAIN LOOP ERROR | "
+                f"{type(error).__name__}: {error}"
+            )
+
+            time.sleep(8)
 
 
 if __name__ == "__main__":
     main()
+
